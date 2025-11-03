@@ -1,6 +1,6 @@
 {
   "name": "cxone",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Cognigy.AI Extension for CXone API Integration, including Signal API with automatic authentication and token management",
   "main": "build/module.js",
   "scripts": {
