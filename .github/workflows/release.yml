@@ -1,0 +1,288 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Get version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Creating release for version: $VERSION"
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "⚠️  Tag v${{ steps.version.outputs.version }} already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "✅ Tag v${{ steps.version.outputs.version }} does not exist, will create"
+          fi
+
+      - name: Install dependencies
+        if: steps.check_tag.outputs.exists == 'false'
+        run: npm ci
+
+      - name: Run build
+        if: steps.check_tag.outputs.exists == 'false'
+        run: npm run build
+
+      - name: Get package name
+        if: steps.check_tag.outputs.exists == 'false'
+        id: package_name
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            ${{ steps.package_name.outputs.name }}-${{ steps.version.outputs.version }}.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip release creation
+        if: steps.check_tag.outputs.exists == 'true'
+        run: |
+          echo "Tag v${{ steps.version.outputs.version }} already exists. Skipping release creation."
+          echo "If you need to create a new release, bump the version in package.json."
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: release
+    if: always() && needs.release.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Get version and determine release type
+        id: version_info
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          # Parse current version
+          if [[ $CURRENT_VERSION =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            CURRENT_MAJOR="${BASH_REMATCH[1]}"
+            CURRENT_MINOR="${BASH_REMATCH[2]}"
+            CURRENT_PATCH="${BASH_REMATCH[3]}"
+          else
+            echo "❌ Invalid current version format: $CURRENT_VERSION"
+            exit 1
+          fi
+
+          # Get previous release tag
+          PREVIOUS_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || echo "")
+
+          if [[ -z "$PREVIOUS_TAG" ]]; then
+            # First release - assume major
+            RELEASE_TYPE="major"
+            echo "📦 First release detected: v$CURRENT_VERSION (Type: $RELEASE_TYPE)"
+          else
+            # Parse previous version
+            PREVIOUS_VERSION="${PREVIOUS_TAG#v}"
+
+            if [[ $PREVIOUS_VERSION =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              PREVIOUS_MAJOR="${BASH_REMATCH[1]}"
+              PREVIOUS_MINOR="${BASH_REMATCH[2]}"
+              PREVIOUS_PATCH="${BASH_REMATCH[3]}"
+            else
+              echo "❌ Invalid previous version format: $PREVIOUS_VERSION"
+              exit 1
+            fi
+
+            # Compare versions to determine release type
+            if [[ $CURRENT_MAJOR -gt $PREVIOUS_MAJOR ]]; then
+              RELEASE_TYPE="major"
+            elif [[ $CURRENT_MINOR -gt $PREVIOUS_MINOR ]]; then
+              RELEASE_TYPE="minor"
+            elif [[ $CURRENT_PATCH -gt $PREVIOUS_PATCH ]]; then
+              RELEASE_TYPE="patch"
+            else
+              echo "❌ Current version ($CURRENT_VERSION) is not greater than previous version ($PREVIOUS_VERSION)"
+              exit 1
+            fi
+
+            echo "📦 Version: $PREVIOUS_VERSION → $CURRENT_VERSION (Type: $RELEASE_TYPE)"
+          fi
+
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Get package name
+        id: package_name
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Parse deployment config
+        id: parse_config
+        run: |
+          # Install yq for YAML parsing
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+          CONFIG_FILE=".github/cognigy-deployments.yml"
+          RELEASE_TYPE="${{ steps.version_info.outputs.release_type }}"
+
+          # Get all enabled deployments that match the release type
+          DEPLOYMENTS=$(yq eval ".deployments[] | select(.enabled == true) | select(.releaseTypes[] == \"$RELEASE_TYPE\")" "$CONFIG_FILE" -o=json -I=0)
+
+          if [[ -z "$DEPLOYMENTS" ]]; then
+            echo "No deployments configured for release type: $RELEASE_TYPE"
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Convert to matrix format
+          MATRIX=$(echo "$DEPLOYMENTS" | jq -s '.')
+          {
+            echo "matrix<<EOF"
+            echo "$MATRIX"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          echo "count=$(echo "$MATRIX" | jq 'length')" >> $GITHUB_OUTPUT
+
+          echo "🎯 Found $(echo "$MATRIX" | jq 'length') deployment(s) for release type: $RELEASE_TYPE"
+          echo "$MATRIX" | jq -r '.[] | "  - \(.name) (\(.environment))"'
+
+      - name: Deploy to Cognigy environments
+        if: steps.parse_config.outputs.count != '0'
+        env:
+          FAIL_FAST: ${{ vars.COGNIGY_FAIL_FAST || 'false' }}
+          VERSION: ${{ steps.version_info.outputs.version }}
+          PACKAGE_NAME: ${{ steps.package_name.outputs.name }}
+          COGNIGY_CSA_INT_API_KEY: ${{ secrets.COGNIGY_CSA_INT_API_KEY }}
+          COGNIGY_CSA_INT_URL: ${{ secrets.COGNIGY_CSA_INT_URL }}
+        run: |
+          DEPLOYMENTS='${{ steps.parse_config.outputs.matrix }}'
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${PACKAGE_NAME}-${VERSION}.tar.gz"
+
+          echo "📦 Extension URL: $RELEASE_URL"
+          echo ""
+
+          FAILED_DEPLOYMENTS=()
+
+          # Deploy to each environment
+          echo "$DEPLOYMENTS" | jq -c '.[]' | while read -r deployment; do
+            NAME=$(echo "$deployment" | jq -r '.name')
+            ENV=$(echo "$deployment" | jq -r '.environment')
+            PROJECT_ID=$(echo "$deployment" | jq -r '.projectId')
+
+            echo "🚀 Deploying to: $NAME ($ENV)"
+
+            # Get secrets for this environment
+            API_KEY_VAR="COGNIGY_${ENV}_API_KEY"
+            API_URL_VAR="COGNIGY_${ENV}_URL"
+
+            API_KEY="${!API_KEY_VAR}"
+            API_URL="${!API_URL_VAR}"
+
+            if [[ -z "$API_KEY" ]]; then
+              echo "❌ Missing secret: $API_KEY_VAR"
+              FAILED_DEPLOYMENTS+=("$NAME: Missing API key")
+              [[ "$FAIL_FAST" == "true" ]] && exit 1
+              continue
+            fi
+
+            if [[ -z "$API_URL" ]]; then
+              echo "❌ Missing secret: $API_URL_VAR"
+              FAILED_DEPLOYMENTS+=("$NAME: Missing API URL")
+              [[ "$FAIL_FAST" == "true" ]] && exit 1
+              continue
+            fi
+
+            # Check if extension exists
+            echo "🔍 Checking if extension exists..."
+            CHECK_RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+              "${API_URL}/v2.0/extensions?projectId=${PROJECT_ID}&filter=${PACKAGE_NAME}" \
+              -H "X-API-Key: ${API_KEY}" \
+              -H "Accept: application/json")
+
+            CHECK_HTTP_CODE=$(echo "$CHECK_RESPONSE" | tail -n1)
+            CHECK_BODY=$(echo "$CHECK_RESPONSE" | head -n -1)
+
+            if [[ "$CHECK_HTTP_CODE" != "200" ]]; then
+              echo "❌ Failed to check extension existence (HTTP $CHECK_HTTP_CODE)"
+              echo "Response: $CHECK_BODY"
+              FAILED_DEPLOYMENTS+=("$NAME: Check failed HTTP $CHECK_HTTP_CODE")
+              [[ "$FAIL_FAST" == "true" ]] && exit 1
+              continue
+            fi
+
+            # Determine if extension exists
+            EXTENSION_COUNT=$(echo "$CHECK_BODY" | jq '.items | length')
+
+            if [[ "$EXTENSION_COUNT" -gt 0 ]]; then
+              echo "📝 Extension exists - updating..."
+              ENDPOINT="${API_URL}/v2.0/extensions/update"
+              PAYLOAD="{\"projectId\":\"${PROJECT_ID}\",\"url\":\"${RELEASE_URL}\",\"extension\":\"${PACKAGE_NAME}\"}"
+            else
+              echo "📦 Extension does not exist - uploading..."
+              ENDPOINT="${API_URL}/v2.0/extensions/upload"
+              PAYLOAD="{\"projectId\":\"${PROJECT_ID}\",\"url\":\"${RELEASE_URL}\",\"name\":\"${PACKAGE_NAME}\"}"
+            fi
+
+            # Make deployment API request
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              "${ENDPOINT}" \
+              -H "X-API-Key: ${API_KEY}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -d "${PAYLOAD}")
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | head -n -1)
+
+            if [[ "$HTTP_CODE" == "202" ]]; then
+              TASK_ID=$(echo "$BODY" | jq -r '._id // "unknown"')
+              echo "✅ Deployment accepted (Task ID: $TASK_ID)"
+            else
+              echo "❌ Deployment failed (HTTP $HTTP_CODE)"
+              echo "Response: $BODY"
+              FAILED_DEPLOYMENTS+=("$NAME: HTTP $HTTP_CODE")
+              [[ "$FAIL_FAST" == "true" ]] && exit 1
+            fi
+
+            echo ""
+          done
+
+          # Report failures
+          if [[ ${#FAILED_DEPLOYMENTS[@]} -gt 0 ]]; then
+            echo "❌ Some deployments failed:"
+            printf '%s\n' "${FAILED_DEPLOYMENTS[@]}"
+            exit 1
+          fi
+
+          echo "✅ All deployments successful"

@@ -1,0 +1,32 @@
+# Cognigy Extension Deployment Configuration
+#
+# This file defines which Cognigy projects should receive automatic extension deployments
+# when releases are created.
+#
+# SETUP INSTRUCTIONS:
+# 1. Copy this file: cp .github/cognigy-deployments.yml.example .github/cognigy-deployments.yml
+# 2. Update the deployments below with your project IDs
+# 3. Add GitHub Secrets (see GITHUB_ACTIONS_SETUP.md)
+# 4. Update .github/workflows/release.yml to include your secrets in the env: block
+#
+# Required GitHub Secrets per environment:
+#   COGNIGY_{ENVIRONMENT}_API_KEY  - API key for authentication
+#   COGNIGY_{ENVIRONMENT}_URL      - Base URL (e.g., https://api-trial.cognigy.ai)
+#
+# GitHub Repository Variables (optional):
+#   COGNIGY_FAIL_FAST - Set to 'true' to fail workflow on first deployment error (default: false)
+
+deployments:
+  # Example deployment - replace with your details
+  - name: "My Environment"
+    environment: "CSA_INT"  # Used to construct secret names: COGNIGY_CSA_INT_API_KEY, COGNIGY_CSA_INT_URL
+    projectId: "your-project-id-here"
+    releaseTypes: ["major", "minor", "patch"]
+    enabled: true
+
+  # Additional environment example (disabled by default)
+  # - name: "Production"
+  #   environment: "PROD"  # Requires: COGNIGY_PROD_API_KEY, COGNIGY_PROD_URL
+  #   projectId: "your-prod-project-id"
+  #   releaseTypes: ["major", "minor"]  # Only deploy major/minor to prod
+  #   enabled: false

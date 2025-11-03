@@ -1,0 +1,64 @@
+name: Version Check
+
+on:
+  pull_request:
+    branches:
+      - develop
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR branch version
+        id: pr_version
+        run: |
+          PR_VERSION=$(node -p "require('./package.json').version")
+          echo "version=$PR_VERSION" >> $GITHUB_OUTPUT
+          echo "PR branch version: $PR_VERSION"
+
+      - name: Get develop branch version
+        id: develop_version
+        run: |
+          git checkout origin/develop
+          DEVELOP_VERSION=$(node -p "require('./package.json').version")
+          echo "version=$DEVELOP_VERSION" >> $GITHUB_OUTPUT
+          echo "Develop branch version: $DEVELOP_VERSION"
+
+      - name: Compare versions
+        run: |
+          if [ "${{ steps.pr_version.outputs.version }}" == "${{ steps.develop_version.outputs.version }}" ]; then
+            echo "❌ Version has not been bumped in package.json"
+            echo "Current develop version: ${{ steps.develop_version.outputs.version }}"
+            echo "PR branch version: ${{ steps.pr_version.outputs.version }}"
+            echo ""
+            echo "Please bump the version using one of:"
+            echo "  npm version patch  (for bug fixes)"
+            echo "  npm version minor  (for new features)"
+            echo "  npm version major  (for breaking changes)"
+            exit 1
+          else
+            echo "✅ Version bumped from ${{ steps.develop_version.outputs.version }} to ${{ steps.pr_version.outputs.version }}"
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run build
+        run: npm run build
